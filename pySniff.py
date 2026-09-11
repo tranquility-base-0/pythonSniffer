@@ -41,6 +41,9 @@ current_channel = None
 _vendor_cache = {}
 _manuf_db = {}
 _session_flows = {}  # Stores flow data (counts, timestamps)
+FLOW_TTL = 900  # seconds; flows idle longer than this are periodically expired
+_last_flow_sweep = 0.0  # monotonic timestamp of last _session_flows cleanup
+FLOW_SWEEP_INTERVAL = 60  # seconds between sweeps
 _beacon_cache = {}        # The empty beacon storage
 _written_bssids = set()   # The empty history of saved PCAPs
 _pending_beacon_bssids = set()  # BSSIDs seen in EAPOL before their beacon arrived
@@ -1006,6 +1009,21 @@ def packet_handler(pkt):
     found_any = False
     intel_str = ""
     flow_key = f"{src}|{dst}"
+
+    # Periodic idle-flow expiry: _session_flows would otherwise grow without
+    # bound on busy networks. Sweeps at most once per FLOW_SWEEP_INTERVAL,
+    # removing only entries idle longer than FLOW_TTL (checked via last_seen,
+    # so active flows are never dropped). Time-based, not per-packet, and no
+    # thread is needed.
+    global _last_flow_sweep
+    now_mono = time.monotonic()
+    if now_mono - _last_flow_sweep >= FLOW_SWEEP_INTERVAL:
+        _last_flow_sweep = now_mono
+        cutoff = datetime.now() - timedelta(seconds=FLOW_TTL)
+        expired = [k for k, fd in _session_flows.items()
+                   if fd.get('last_seen', cutoff) < cutoff]
+        for k in expired:
+            del _session_flows[k]
 
     # --- BLOCK 1: HANDLE UDP PACKETS ---
     if pkt.haslayer(UDP):
