@@ -81,6 +81,24 @@ def get_manufacturer(mac):
         return "N/A"
     if mac in _vendor_cache:
         return _vendor_cache[mac]
+    # Semantic classification takes precedence over OUI/manuf lookup:
+    # well-known broadcast/multicast groups would otherwise be displayed as
+    # raw OUI text (e.g. "OUI:01:00:5E" for IPv4 mDNS 224.0.0.251).
+    m = mac.lower()
+    if m == "ff:ff:ff:ff:ff:ff":
+        return "<Bcast>"
+    if m.startswith("33:33"):
+        return "<Mcast6>"
+    if m.startswith("01:00:5e"):
+        return "<Mcast4>"
+    try:
+        first_octet = int(mac.split(":")[0], 16)
+        is_multicast = bool(first_octet & 0x01)  # I/G bit
+        locally_administered = bool(first_octet & 0x02)  # U/L bit
+        if locally_administered and not is_multicast:
+            return "<Random>"
+    except (ValueError, IndexError):
+        pass
     vendor = None
     try:
         e = EUI(mac)
