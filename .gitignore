@@ -7,3 +7,4 @@ env/
 .env.*
 *.log
 .DS_Store
+juicy_seen.pkl

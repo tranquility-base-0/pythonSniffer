@@ -43,6 +43,8 @@ _manuf_db = {}
 _session_flows = {}  # Stores flow data (counts, timestamps)
 _beacon_cache = {}        # The empty beacon storage
 _written_bssids = set()   # The empty history of saved PCAPs
+_pending_beacon_bssids = set()  # BSSIDs seen in EAPOL before their beacon arrived
+_eapol_msg_seen = {}      # (src, key_num, replay_counter) -> count, for RETX detection (bounded)
 PRINT_COOLDOWN = timedelta(seconds=30)  # Print updates every 30s
 BORING_PORTS = {
     #53,     # Standard DNS
@@ -104,28 +106,39 @@ def set_channel(ch):
     """
     Sets the channel for the IFACE. (For sequential, single-thread design).
     Returns True on success, False on failure.
+    current_channel is only updated after the channel change has succeeded.
     """
     global current_channel
-    current_channel = ch
-    
+
+    # We REMOVED preexec_fn. We want Ctrl+C to be handled
+    # by our main signal_handler.
+    # NOTE: returncode must be checked; a completed subprocess with a
+    # non-zero exit still means the channel change failed.
     try:
-        # We REMOVED preexec_fn. We want Ctrl+C to be handled
-        # by our main signal_handler.
-        subprocess.run(["iw", "dev", IFACE, "set", "channel", str(ch)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
-                       timeout=2)
-        return True
-    except Exception:
-        try:
-            subprocess.run(["iwconfig", IFACE, "channel", str(ch)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, 
-                           timeout=2)
+        if subprocess.run(["iw", "dev", IFACE, "set", "channel", str(ch)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=2).returncode == 0:
+            current_channel = ch
             return True
-        except Exception as e:
-            # If we're stopping, don't print an error
-            if not _stop_sniffing.is_set():
-                print(f"[!] Failed to set channel {ch}: {e}", file=sys.stderr)
-            return False
+    except Exception:
+        pass  # iw missing or timed out; fall through to iwconfig
+
+    try:
+        if subprocess.run(["iwconfig", IFACE, "channel", str(ch)],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=2).returncode == 0:
+            current_channel = ch
+            return True
+    except Exception as e:
+        # If we're stopping, don't print an error
+        if not _stop_sniffing.is_set():
+            print(f"[!] Failed to set channel {ch}: {e}", file=sys.stderr)
+        return False
+
+    # Both commands ran but neither succeeded
+    if not _stop_sniffing.is_set():
+        print(f"[!] Failed to set channel {ch} on {IFACE}", file=sys.stderr)
+    return False
 
 def signal_handler(sig, frame):
     """
@@ -541,7 +554,9 @@ def parse_mdns_payload(raw):
                     txt_str = repr(txt_bytes)
                 # --- End fix ---
 
-                kvs = re.findall(r"([A-Za-z0-9_]+)=([^.\n\r]*)", txt_str)
+                # Values may legitimately contain periods (e.g. hostnames);
+                # values end at the space separating TXT character-strings, or \n / \r.
+                kvs = re.findall(r"([A-Za-z0-9_]+)=([^\s\n\r]*)", txt_str)
                 entry['txt_fields'] = {}
                 for k, v in kvs:
                     v = v.strip()
@@ -587,16 +602,26 @@ def parse_mdns_payload(raw):
             # --- END NEW BLOCK ---
 
             else:
-                # Generic fallback for other RR types
-                if isinstance(rr.rdata, bytes):
-                    rdata_str = rr.rdata.decode('utf-8', errors='ignore')
+                # Generic fallback for other RR types. Structured Scapy RR
+                # subclasses (SRV, SOA, MX, NAPTR, DS, SVCB, HTTPS, TSIG, ...)
+                # have no `rdata` field; their data lives in their own named
+                # fields. Skip raw-rdata extraction for them instead of
+                # raising AttributeError('rdata') — which would escape the
+                # prn callback and tear down Scapy's sniff socket.
+                rdata = getattr(rr, "rdata", None)
+                if rdata is None:
+                    parsed['answers'].append(entry)
+                    continue
+
+                if isinstance(rdata, bytes):
+                    rdata_str = rdata.decode('utf-8', errors='ignore')
                 else:
-                    rdata_str = str(rr.rdata)
+                    rdata_str = str(rdata)
                 entry['rdata'] = rdata_str
 
                 # Extra heuristic: look for embedded printable strings
                 if not re.search(r'[A-Za-z]', rdata_str):
-                    m = re.findall(rb"[ -~]{5,}", bytes(rr.rdata) if isinstance(rr.rdata, (bytes, bytearray)) else b"")
+                    m = re.findall(rb"[ -~]{5,}", bytes(rdata) if isinstance(rdata, (bytes, bytearray)) else b"")
                     if m:
                         printable_bits = [x.decode('utf-8', errors='ignore') for x in m]
                         entry['printables'] = printable_bits
@@ -650,7 +675,7 @@ def parse_dropbox_lansync(raw):
     except Exception:
         return None
 
-def parse_dhcpv6_options_from_payload(raw, manuf_db=None, line_wrap=110):
+def parse_dhcpv6_options_from_payload(raw, line_wrap=110):
     """
     Parse DHCPv6 message (msg-type + 3-byte transaction id + options).
     Decodes DUIDs (Client/Server IDs), extracts vendor class text,
@@ -719,9 +744,8 @@ def parse_dhcpv6_options_from_payload(raw, manuf_db=None, line_wrap=110):
                     ts = struct.unpack_from("!I", duid_bytes, 4)[0]
                     mac_bytes = duid_bytes[8:]
                     mac = ":".join(f"{b:02x}" for b in mac_bytes)
-                    if manuf_db and len(mac_bytes) >= 3:
-                        oui = "".join(f"{b:02x}" for b in mac_bytes[:3]).upper()
-                        vendor = manuf_db.get(oui)
+                    if len(mac_bytes) >= 3:
+                        vendor = get_manufacturer(mac)
                     desc = f"DUID-LLT(hw={hw_type}, ts={ts}, mac={mac})"
                     if vendor:
                         desc += f" [{vendor}]"
@@ -730,9 +754,8 @@ def parse_dhcpv6_options_from_payload(raw, manuf_db=None, line_wrap=110):
                     hw_type = struct.unpack_from("!H", duid_bytes, 2)[0]
                     mac_bytes = duid_bytes[4:]
                     mac = ":".join(f"{b:02x}" for b in mac_bytes)
-                    if manuf_db and len(mac_bytes) >= 3:
-                        oui = "".join(f"{b:02x}" for b in mac_bytes[:3]).upper()
-                        vendor = manuf_db.get(oui)
+                    if len(mac_bytes) >= 3:
+                        vendor = get_manufacturer(mac)
                     desc = f"DUID-LL(hw={hw_type}, mac={mac})"
                     if vendor:
                         desc += f" [{vendor}]"
@@ -873,6 +896,45 @@ def parse_snmp_payload(pkt):
         # print(f"[debug] SNMP parse error: {e}")
         return None
 # -----------------------
+# EAPOL helpers
+# -----------------------
+_EAPOL_MSG_MAX = 128  # bound on tracked (src,key_num,replay_counter) entries
+
+def classify_eapol_key(eapol_key, src):
+    """
+    Classify a WPA 4-way-handshake EAPOL-Key frame from its KeyInfo fields.
+    Returns (label, is_retx) where label is 'M1'..'M4' or 'M?' if the
+    available fields are ambiguous. Retransmissions are identified by a
+    repeated (src, key_num, key_replay_counter) combination.
+    """
+    key_num = 0
+    try:
+        key_num = int(eapol_key.guess_key_number())
+    except Exception:
+        key_num = 0
+    if key_num not in (1, 2, 3, 4):
+        label = "UNCLASSIFIED"
+    else:
+        label = f"M{key_num}"
+
+    # Retransmission: same source, same message number, same replay counter
+    rc = getattr(eapol_key, "key_replay_counter", None)
+    is_retx = False
+    if key_num and rc is not None:
+        sig = (src, key_num, rc)
+        n = _eapol_msg_seen.get(sig, 0)
+        _eapol_msg_seen[sig] = n + 1
+        is_retx = n > 0
+        # keep the state bounded
+        if len(_eapol_msg_seen) > _EAPOL_MSG_MAX:
+            try:
+                oldest = next(iter(_eapol_msg_seen))
+                _eapol_msg_seen.pop(oldest)
+            except Exception:
+                pass
+    return label, is_retx
+
+# -----------------------
 # Packet handler
 # -----------------------
 def frame_direction(dot11):
@@ -900,6 +962,16 @@ def packet_handler(pkt):
     if dot11.type == 0 and dot11.subtype == 8: # Type 0 (Mgmt), Subtype 8 (Beacon)
         bssid = dot11.addr3
         _beacon_cache[bssid] = pkt
+        # If an EAPOL frame already referenced this BSSID but no beacon was
+        # cached at the time, write the (latest) beacon now — exactly once.
+        if bssid in _pending_beacon_bssids and bssid not in _written_bssids:
+            try:
+                from scapy.all import wrpcap
+                wrpcap(HANDSHAKE_PCAP, pkt, append=True)
+                _written_bssids.add(bssid)
+                print(f"[*] Late beacon for {bssid} written to handshake PCAP.")
+            except Exception as e:
+                print(f"[!] Failed to write late beacon for {bssid}: {e}", file=sys.stderr)
         return
     # ------------------------------------
     if dot11.type != 2:
@@ -948,7 +1020,9 @@ def packet_handler(pkt):
         flow_key = f"{src}|{dst}|{sport}|{dport}|{src_ip}|{dst_ip}"
         if sport in (5353, 5355, 1900, 17500) or dport in (5353, 5355, 1900, 17500):
             payload_hash = hashlib.md5(payload).hexdigest()
-            flow_key = f"DISCOVERY|{sport}|{dport}|{payload_hash}"
+            # Include src/dst so different devices sending identical payloads
+            # stay distinct flows (dst separates multicast vs unicast queries)
+            flow_key = f"DISCOVERY|{src}|{dst}|{sport}|{dport}|{payload_hash}"
         # --- END SMART KEY ---
 
         flow_data = _session_flows.get(flow_key)
@@ -1419,8 +1493,17 @@ def packet_handler(pkt):
                 save_status = f" [Save Error: {e}]"
             # -----------------------------------
 
+            # Track BSSIDs seen in EAPOL frames whose beacon wasn't cached yet,
+            # so a later-arriving beacon can still be written (once) at that time.
+            if bssid and bssid not in _beacon_cache:
+                _pending_beacon_bssids.add(bssid)
+
             flow_key = f"EAPOL|{src}"
             now = datetime.now()
+
+            # Classify from EAPOL-Key fields (M1..M4 / unclassified + retransmission)
+            label, is_retx = classify_eapol_key(pkt[EAPOL], src)
+
             flow_data = _session_flows.get(flow_key)
             show_packet = False
 
@@ -1440,6 +1523,27 @@ def packet_handler(pkt):
                 else:
                     show_packet = False
 
+            # Handshake-visibility rule: message-number transitions are always
+            # shown (each M1..M4 is a distinct event), and the first RETX of a
+            # given message is shown; only exact repeats of an already-printed
+            # (src, msg, replay_counter) beyond the first retransmission and
+            # without cooldown expiry are suppressed.
+            if not is_retx:
+                # A new (different) message number in this flow always prints
+                msg_sig = (src, label)
+                if flow_data.get('last_msg_sig') != msg_sig:
+                    flow_data['last_msg_sig'] = msg_sig
+                    show_packet = True
+                    flow_data['last_printed'] = now
+            else:
+                # Retransmission: print the first retransmission of a message,
+                # suppress further identical ones until cooldown expires.
+                retx_sig = (src, label, getattr(pkt[EAPOL], "key_replay_counter", None))
+                if flow_data.get('last_retx_sig') != retx_sig:
+                    flow_data['last_retx_sig'] = retx_sig
+                    show_packet = True
+                    flow_data['last_printed'] = now
+
             if show_packet:
                 tid = "N/A"
                 if pkt.haslayer(Dot11QoS):
@@ -1452,10 +1556,11 @@ def packet_handler(pkt):
                 t2 = flow_data['last_seen'].strftime("%H:%M:%S")
 
                 header_str = f"[Seen: {count}x] [First: {t1}] [Last: {t2}] "
+                retx_tag = " [RETX]" if is_retx else ""
                 print(f"{header_str}Type:{frame_type} Subtype:0x{subtype:02x} | Dir:{direction} | CH:{ch} | Len:{pkt_len} | TID:{tid}")
 
                 print(f"{src} ({src_vendor}) → {dst} ({dst_vendor})")
-                print(f"→ EAPOL-Key: WPA2/3 Handshake{save_status}")
+                print(f"→ EAPOL-Key {label}{retx_tag}: WPA2/3 Handshake{save_status}")
                 print("="*80)
 
     # --- BLOCK 4: HANDLE ICMPv6 (Neighbor Discovery) ---
