@@ -48,6 +48,8 @@ _beacon_cache = {}        # The empty beacon storage
 _written_bssids = set()   # The empty history of saved PCAPs
 _pending_beacon_bssids = set()  # BSSIDs seen in EAPOL before their beacon arrived
 _eapol_msg_seen = {}      # (src, key_num, replay_counter) -> count, for RETX detection (bounded)
+_ssid_cache = {}          # BSSID -> SSID (display only); FIFO-bounded
+_SSID_CACHE_MAX = 128
 PRINT_COOLDOWN = timedelta(seconds=30)  # Print updates every 30s
 BORING_PORTS = {
     #53,     # Standard DNS
@@ -980,9 +982,30 @@ def packet_handler(pkt):
     # --- NEW: SILENT BEACON COLLECTOR ---
     # We need to save Beacons to the PCAP so Aircrack knows the SSID (Network Name).
     # But we don't want to analyze or print them.
-    if dot11.type == 0 and dot11.subtype == 8: # Type 0 (Mgmt), Subtype 8 (Beacon)
+    if dot11.type == 0 and dot11.subtype in (8, 5): # Mgmt: Beacon (8), Probe Response (5)
         bssid = dot11.addr3
         _beacon_cache[bssid] = pkt
+        # Display-only SSID enrichment: extract the SSID element (Dot11Elt ID 0)
+        # from this beacon/probe-response and refresh the bounded BSSID->SSID
+        # cache. Hidden/zero-length/padding SSIDs are stored as None (unknown).
+        try:
+            ssid_val = None
+            for elt in pkt[Dot11Beacon][Dot11Elt]:
+                if getattr(elt, "ID", None) == 0:
+                    raw = bytes(elt.info or b"")
+                    if raw and not all(b == 0 for b in raw):
+                        ssid_val = raw.decode("utf-8", errors="ignore").strip()
+                        if not ssid_val:
+                            ssid_val = None
+                    break  # first SSID element is the beacon's SSID
+            if bssid in _ssid_cache:
+                del _ssid_cache[bssid]  # refresh: move to end for FIFO semantics
+            _ssid_cache[bssid] = ssid_val
+            if len(_ssid_cache) > _SSID_CACHE_MAX:
+                oldest = next(iter(_ssid_cache))
+                del _ssid_cache[oldest]
+        except Exception:
+            pass  # malformed beacon must not break packet handling
         # If an EAPOL frame already referenced this BSSID but no beacon was
         # cached at the time, write the (latest) beacon now — exactly once.
         if bssid in _pending_beacon_bssids and bssid not in _written_bssids:
@@ -1019,6 +1042,12 @@ def packet_handler(pkt):
     elif pkt.haslayer(IPv6):
         src_ip, dst_ip = pkt[IPv6].src, pkt[IPv6].dst
     # ---------------------------------------------------
+
+    # Display-only SSID enrichment: the BSSID is always shown; the SSID is
+    # appended once it has been learned from a beacon (<Unknown> until then).
+    cached_ssid = _ssid_cache.get(bssid)
+    ssid_part = cached_ssid if cached_ssid else "<Unknown>"
+    net_tag = f" | BSSID:{bssid} ({ssid_part})" if bssid else ""
 
     # Predefine optional protocol lists so they're always safe to reference
     qs = []
@@ -1213,7 +1242,7 @@ def packet_handler(pkt):
         first_seen_str = flow_data['first_seen'].strftime("%H:%M:%S")
         last_seen_str = flow_data['last_seen'].strftime("%H:%M:%S")
         header_str = f"[Seen: {count}x] [First: {first_seen_str}] [Last: {last_seen_str}] "
-        print(f"{header_str}Type:{frame_type} Subtype:0x{subtype:02x} | Dir:{direction} | CH:{ch}")
+        print(f"{header_str}Type:{frame_type} Subtype:0x{subtype:02x} | Dir:{direction} | CH:{ch}{net_tag}")
         print(f"{src} ({src_vendor}) → {dst} ({dst_vendor}) | UDP {sport}->{dport}")
 
         parsed_protocol = False
@@ -1342,7 +1371,7 @@ def packet_handler(pkt):
                 last_seen_str = flow_data['last_seen'].strftime("%H:%M:%S")
 
                 header_str = f"[Seen: {count}x] [First: {first_seen_str}] [Last: {last_seen_str}] "
-                print(f"{header_str}Type:ARP Subtype:Reply | Dir:{direction} | CH:{ch}")
+                print(f"{header_str}Type:ARP Subtype:Reply | Dir:{direction} | CH:{ch}{net_tag}")
 
                 print(f"{mac} ({get_manufacturer(mac)}) ⇔ {ip}")
                 print("→ ARP Reply (is-at): Device IP/MAC mapping confirmed.")
@@ -1417,7 +1446,7 @@ def packet_handler(pkt):
         last_seen_str = flow_data['last_seen'].strftime("%H:%M:%S")
 
         header_str = f"[Seen: {count}x] [First: {first_seen_str}] [Last: {last_seen_str}] "
-        print(f"{header_str}Type:TCP Subtype:Data | Dir:{direction} | CH:{ch}")
+        print(f"{header_str}Type:TCP Subtype:Data | Dir:{direction} | CH:{ch}{net_tag}")
 
         # FIX 3: Print IPs (src_ip/dst_ip) alongside MACs
         src_str = f"{src} ({src_vendor})"
@@ -1593,7 +1622,7 @@ def packet_handler(pkt):
 
                 header_str = f"[Seen: {count}x] [First: {t1}] [Last: {t2}] "
                 retx_tag = " [RETX]" if is_retx else ""
-                print(f"{header_str}Type:{frame_type} Subtype:0x{subtype:02x} | Dir:{direction} | CH:{ch} | Len:{pkt_len} | TID:{tid}")
+                print(f"{header_str}Type:{frame_type} Subtype:0x{subtype:02x} | Dir:{direction} | CH:{ch} | Len:{pkt_len} | TID:{tid}{net_tag}")
 
                 print(f"{src} ({src_vendor}) → {dst} ({dst_vendor})")
                 print(f"→ EAPOL-Key {label}{retx_tag}: WPA2/3 Handshake{save_status}")
@@ -1723,7 +1752,7 @@ def packet_handler(pkt):
             last_seen_str = flow_data['last_seen'].strftime("%H:%M:%S")
 
             header_str = f"[Seen: {count}x] [First: {first_seen_str}] [Last: {last_seen_str}] "
-            print(f"{header_str}Type:{frame_type} Subtype:0x{subtype:02x} | Dir:{direction} | CH:{ch} | Len:{pkt_len} | TID:{tid}")
+            print(f"{header_str}Type:{frame_type} Subtype:0x{subtype:02x} | Dir:{direction} | CH:{ch} | Len:{pkt_len} | TID:{tid}{net_tag}")
 
             print(f"{src} ({src_vendor}) → {dst} ({dst_vendor})")
 
