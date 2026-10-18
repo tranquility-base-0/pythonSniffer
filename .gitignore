@@ -8,3 +8,7 @@ env/
 *.log
 .DS_Store
 juicy_seen.pkl
+
+# Packet captures and network traffic
+*.pcap
+*.pcapng
